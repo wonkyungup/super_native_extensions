@@ -22,7 +22,10 @@ function Resolve-Symlinks {
             $realPath += '/'
         }
 
-        $item = Get-Item $realPath
+        # -Force is required so Get-Item can read hidden/system folders such as
+        # %LOCALAPPDATA% (the pub cache lives under a hidden AppData path). Without
+        # it, resolving the cache path throws and the Windows build fails.
+        $item = Get-Item -Force $realPath
         if ($item.LinkTarget) {
             $realPath = $item.LinkTarget.Replace('\', '/')
         }

@@ -6,6 +6,12 @@ get_filename_component(cargokit_cmake_root "${cargokit_cmake_root}" REALPATH)
 if(WIN32)
     # REALPATH does not properly resolve symlinks on windows :-/
     execute_process(COMMAND powershell -ExecutionPolicy Bypass -File "${CMAKE_CURRENT_LIST_DIR}/resolve_symlinks.ps1" "${cargokit_cmake_root}" OUTPUT_VARIABLE cargokit_cmake_root OUTPUT_STRIP_TRAILING_WHITESPACE)
+    # CMake 4.x runs `chcp 65001` before powershell via execute_process, so the
+    # captured OUTPUT_VARIABLE gets prefixed with "Active code page: 65001\n".
+    # If left in, cargokit_cmake_root becomes an invalid path and vcxproj
+    # generation breaks. Strip that prefix and any surrounding whitespace.
+    string(REGEX REPLACE "Active code page: [0-9]+\r?\n?" "" cargokit_cmake_root "${cargokit_cmake_root}")
+    string(STRIP "${cargokit_cmake_root}" cargokit_cmake_root)
 endif()
 
 # Arguments
