@@ -39,6 +39,9 @@ class DataProviderManagerImpl implements DataProviderManager {
         _lazyData[representation.id] = representation;
       } else if (representation is DataRepresentationVirtualFile) {
         _virtualFile[representation.id] = representation;
+      } else if (representation is DataRepresentationVirtualFolder) {
+        _virtualFolder[representation.id] = representation;
+        _virtualFolderList[representation.listId] = representation;
       }
     }
 
@@ -55,6 +58,9 @@ class DataProviderManagerImpl implements DataProviderManager {
           _lazyData.remove(representation.id);
         } else if (representation is DataRepresentationVirtualFile) {
           _virtualFile.remove(representation.id);
+        } else if (representation is DataRepresentationVirtualFolder) {
+          _virtualFolder.remove(representation.id);
+          _virtualFolderList.remove(representation.listId);
         }
       }
     }
@@ -68,17 +74,29 @@ class DataProviderManagerImpl implements DataProviderManager {
       if (lazyData != null) {
         return _ValuePromiseResult.ok(await lazyData.dataProvider())
             .serialize();
-      } else {
-        return _ValuePromiseResult.cancelled().serialize();
       }
+      final folder = _virtualFolderList[valueId];
+      if (folder != null) {
+        try {
+          final entries = await folder.listProvider();
+          return _ValuePromiseResult.ok(
+                  entries.map((e) => e.serialize()).toList())
+              .serialize();
+        } catch (_) {
+          return _ValuePromiseResult.cancelled().serialize();
+        }
+      }
+      return _ValuePromiseResult.cancelled().serialize();
     } else if (call.method == 'getVirtualFile') {
       final args = call.arguments;
       final sessionId = args['sessionId'] as int;
       final virtualFileId = args['virtualFileId'] as int;
+      final subPath = args['subPath'] as String?;
       final fileHandle = args['streamHandle'] as int;
       return _getVirtualFile(
           sessionId: sessionId,
           virtualFileId: virtualFileId,
+          subPath: subPath,
           streamHandle: fileHandle);
     } else if (call.method == 'cancelVirtualFile') {
       final sessionId = call.arguments as int;
@@ -96,6 +114,7 @@ class DataProviderManagerImpl implements DataProviderManager {
   Future<dynamic> _getVirtualFile({
     required int sessionId,
     required int virtualFileId,
+    String? subPath,
     required int streamHandle,
   }) async {
     final progressNotifier = ValueNotifier<double>(0.0);
@@ -132,7 +151,9 @@ class DataProviderManagerImpl implements DataProviderManager {
     );
 
     final virtualFile = _virtualFile[virtualFileId];
-    if (virtualFile != null) {
+    final virtualFolder =
+        subPath != null ? _virtualFolder[virtualFileId] : null;
+    if (virtualFile != null || virtualFolder != null) {
       EventSink provider({required int fileSize}) {
         if (session._fileSize != null && session._fileSize != fileSize) {
           throw StateError("File size can not be changed");
@@ -147,7 +168,11 @@ class DataProviderManagerImpl implements DataProviderManager {
         return sink;
       }
 
-      virtualFile.virtualFileProvider(provider, progress);
+      if (virtualFolder != null) {
+        virtualFolder.fileProvider(subPath!, provider, progress);
+      } else {
+        virtualFile!.virtualFileProvider(provider, progress);
+      }
     } else {
       onError('Virtual file ($virtualFileId)not found');
     }
@@ -166,6 +191,8 @@ class DataProviderManagerImpl implements DataProviderManager {
   final _handles = <int, DataProviderHandle>{};
   final _lazyData = <int, DataRepresentationLazy>{};
   final _virtualFile = <int, DataRepresentationVirtualFile>{};
+  final _virtualFolder = <int, DataRepresentationVirtualFolder>{};
+  final _virtualFolderList = <int, DataRepresentationVirtualFolder>{};
   final _virtualSessions = <int, _VirtualSession>{};
 }
 

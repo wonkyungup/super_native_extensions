@@ -32,19 +32,19 @@ use windows::{
             IDataObjectAsyncCapability, IDataObjectAsyncCapability_Impl, SHCreateMemStream,
             SHCreateStdEnumFmtEtc, CFSTR_FILECONTENTS, CFSTR_FILEDESCRIPTOR,
             CFSTR_LOGICALPERFORMEDDROPEFFECT, CFSTR_PERFORMEDDROPEFFECT, DROPFILES, FD_ATTRIBUTES,
-            FD_PROGRESSUI, FILEDESCRIPTORW,
+            FD_FILESIZE, FD_PROGRESSUI, FILEDESCRIPTORW,
         },
     },
 };
 
 use crate::{
-    api_model::{DataProviderValueId, DataRepresentation, VirtualFileStorage},
+    api_model::{DataProviderValueId, DataRepresentation, VirtualFileStorage, VirtualFolderEntry},
     data_provider_manager::{DataProviderHandle, PlatformDataProviderDelegate, VirtualFileResult},
     log::OkLog,
     segmented_queue::{new_segmented_queue, QueueConfiguration},
     util::DropNotifier,
     value_coerce::{CoerceToData, StringFormat},
-    value_promise::{Promise, ValuePromiseResult},
+    value_promise::{Promise, ValuePromise, ValuePromiseResult},
 };
 
 use super::{
@@ -60,9 +60,36 @@ use super::{
 
 const DATA_E_FORMATETC: HRESULT = HRESULT(-2147221404 + 1);
 
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+
 struct ProviderEntry {
     provider: Rc<PlatformDataProvider>,
     _handle: Arc<DataProviderHandle>,
+}
+
+enum FolderListState {
+    Pending(Arc<ValuePromise>),
+    Done(Rc<Vec<VirtualFolderEntry>>),
+}
+
+enum FlatKind {
+    Dir,
+    File {
+        provider_index: usize,
+    },
+    FolderFile {
+        provider_index: usize,
+        sub_path: String,
+    },
+}
+
+/// One entry of the file group descriptor.
+struct FlatEntry {
+    name: String,
+    is_dir: bool,
+    size: Option<i64>,
+    kind: FlatKind,
 }
 
 #[implement(IDataObject, IDataObjectAsyncCapability)]
@@ -72,6 +99,11 @@ pub struct DataObject {
     in_operation: Cell<bool>, // async stream
     virtual_stream_notifiers: RefCell<Vec<Arc<DropNotifier>>>,
     thread_pool: RefCell<Option<ThreadPool>>,
+    /// Set by the drop source when the user releases over a target.
+    drop_committed: Rc<Cell<bool>>,
+    folder_lists: RefCell<HashMap<DataProviderValueId, FolderListState>>,
+    /// Descriptor entries once every virtual folder listing is known.
+    complete_entries: RefCell<Option<Rc<Vec<FlatEntry>>>>,
 }
 
 /// These formats are not commonly supported on Windows. If they
@@ -83,6 +115,15 @@ static FOREIGN_IMAGE_FORMATS: &[&str] = &["PNG", "GIF", "JFIF"];
 impl DataObject {
     pub fn create(
         providers: Vec<(Rc<PlatformDataProvider>, Arc<DataProviderHandle>)>,
+    ) -> IDataObject {
+        Self::create_for_drag(providers, Rc::new(Cell::new(false)))
+    }
+
+    /// `drop_committed` is set by the drop source once the user releases the
+    /// mouse over a target; until then descriptor requests are hover requests.
+    pub fn create_for_drag(
+        providers: Vec<(Rc<PlatformDataProvider>, Arc<DataProviderHandle>)>,
+        drop_committed: Rc<Cell<bool>>,
     ) -> IDataObject {
         let data_object = Self {
             providers: providers
@@ -96,6 +137,9 @@ impl DataObject {
             in_operation: Cell::new(false),
             virtual_stream_notifiers: RefCell::new(Vec::new()),
             thread_pool: RefCell::new(None),
+            drop_committed,
+            folder_lists: RefCell::new(HashMap::new()),
+            complete_entries: RefCell::new(None),
         };
         data_object.into()
     }
@@ -249,7 +293,9 @@ impl DataObject {
         // Put virtual files first
         for provider in &self.providers {
             for repr in &provider.provider.data.representations {
-                if repr.is_virtual_file() {
+                // A virtual folder expands to many contents indices once
+                // listed; QueryGetData accepts any index for those.
+                if repr.is_virtual_file() || repr.is_virtual_folder() {
                     if index == 0 {
                         res.push(make_format_with_tymed(
                             unsafe { RegisterClipboardFormatW(CFSTR_FILEDESCRIPTOR) },
@@ -299,41 +345,206 @@ impl DataObject {
         res
     }
 
-    fn file_descriptor_for_item(file_name: &str) -> FILEDESCRIPTORW {
+    /// `cFileName` holds 260 UTF-16 units including the terminating null.
+    const MAX_DESCRIPTOR_NAME: usize = 259;
+
+    fn file_descriptor_for_entry(
+        file_name: &str,
+        is_dir: bool,
+        size: Option<i64>,
+    ) -> FILEDESCRIPTORW {
         let mut name_buf: [u16; 260] = [0; 260];
         let mut name_str: Vec<_> = file_name.encode_utf16().collect();
         name_str.truncate(name_buf.len() - 1);
         name_buf[0..name_str.len()].copy_from_slice(&name_str);
+        let mut flags = FD_ATTRIBUTES.0 | FD_PROGRESSUI.0;
+        let mut size_high = 0;
+        let mut size_low = 0;
+        if let Some(size) = size.filter(|_| !is_dir) {
+            flags |= FD_FILESIZE.0;
+            size_high = (size as u64 >> 32) as u32;
+            size_low = (size as u64 & 0xFFFF_FFFF) as u32;
+        }
         FILEDESCRIPTORW {
-            dwFlags: (FD_ATTRIBUTES.0 | FD_PROGRESSUI.0) as u32,
+            dwFlags: flags as u32,
+            dwFileAttributes: if is_dir {
+                FILE_ATTRIBUTE_DIRECTORY
+            } else {
+                FILE_ATTRIBUTE_NORMAL
+            },
+            nFileSizeHigh: size_high,
+            nFileSizeLow: size_low,
             cFileName: name_buf,
             ..FILEDESCRIPTORW::default()
         }
     }
 
-    fn data_for_file_group_descritor(&self) -> Option<Vec<u8>> {
-        let mut cnt = 0;
-        let mut descriptors = Vec::<FILEDESCRIPTORW>::new();
-        for provider in &self.providers {
-            let data = &provider.provider.data;
-            if data.representations.iter().any(|a| a.is_virtual_file()) {
-                cnt += 1;
-                let name = data
-                    .suggested_name
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| format!("File {cnt}"));
-                descriptors.push(Self::file_descriptor_for_item(&name));
+    /// Listing of a virtual folder. Starts the (lazy) request on first call.
+    /// With `wait` it pumps the run loop until the listing arrives (UI keeps
+    /// running); without it returns `None` while the listing is still pending.
+    fn folder_listing(
+        &self,
+        provider: &PlatformDataProvider,
+        list_id: DataProviderValueId,
+        wait: bool,
+    ) -> Option<Rc<Vec<VirtualFolderEntry>>> {
+        let promise = {
+            let mut lists = self.folder_lists.borrow_mut();
+            match lists.get(&list_id) {
+                Some(FolderListState::Done(entries)) => return Some(entries.clone()),
+                Some(FolderListState::Pending(promise)) => promise.clone(),
+                None => {
+                    let delegate = provider.delegate.upgrade()?;
+                    let promise = delegate.get_lazy_data(provider.isolate_id, list_id, None);
+                    lists.insert(list_id, FolderListState::Pending(promise.clone()));
+                    promise
+                }
+            }
+        };
+        let mut poll_session = PollSession::new();
+        loop {
+            // Another (re-entrant) call may have finished it while we polled.
+            if let Some(FolderListState::Done(entries)) = self.folder_lists.borrow().get(&list_id) {
+                return Some(entries.clone());
+            }
+            match promise.try_take() {
+                Some(result) => {
+                    let mut entries = match result {
+                        ValuePromiseResult::Ok { value } => {
+                            Vec::<VirtualFolderEntry>::try_from(value)
+                                .ok_log()
+                                .unwrap_or_default()
+                        }
+                        ValuePromiseResult::Cancelled => Vec::new(),
+                    };
+                    // Parents before children.
+                    entries.sort_by(|a, b| a.path.cmp(&b.path));
+                    let entries = Rc::new(entries);
+                    self.folder_lists
+                        .borrow_mut()
+                        .insert(list_id, FolderListState::Done(entries.clone()));
+                    return Some(entries);
+                }
+                None if !wait => return None,
+                None => RunLoop::current()
+                    .platform_run_loop
+                    .poll_once(&mut poll_session),
             }
         }
+    }
+
+    fn has_virtual_folder(&self) -> bool {
+        self.providers.iter().any(|p| {
+            p.provider
+                .data
+                .representations
+                .iter()
+                .any(|r| r.is_virtual_folder())
+        })
+    }
+
+    /// Whether the receiver is actually transferring (as opposed to just
+    /// hovering). Only then the complete folder listing is worth waiting for.
+    fn is_transferring(&self) -> bool {
+        self.in_operation.get() || self.drop_committed.get()
+    }
+
+    /// Flattened list of everything the file group descriptor announces;
+    /// `CFSTR_FILECONTENTS` `lindex` indexes into this.
+    ///
+    /// Virtual folders contribute their own directory entry followed by their
+    /// listing. While hovering (`complete == false`) a listing that is not
+    /// ready yet is left out instead of waited for, so the drag never stalls.
+    fn flat_entries(&self, complete: bool) -> Rc<Vec<FlatEntry>> {
+        if let Some(entries) = self.complete_entries.borrow().as_ref() {
+            return entries.clone();
+        }
         let mut res = Vec::new();
-        let len = descriptors.len() as u32;
+        let mut all_listed = true;
+        let mut cnt = 0;
+        for (provider_index, provider) in self.providers.iter().enumerate() {
+            let data = &provider.provider.data;
+            for repr in &data.representations {
+                match repr {
+                    DataRepresentation::VirtualFile { .. } => {
+                        cnt += 1;
+                        let name = data
+                            .suggested_name
+                            .clone()
+                            .unwrap_or_else(|| format!("File {cnt}"));
+                        res.push(FlatEntry {
+                            name,
+                            is_dir: false,
+                            size: None,
+                            kind: FlatKind::File { provider_index },
+                        });
+                        break;
+                    }
+                    DataRepresentation::VirtualFolder { list_id, .. } => {
+                        cnt += 1;
+                        let top = data
+                            .suggested_name
+                            .clone()
+                            .unwrap_or_else(|| format!("Folder {cnt}"));
+                        res.push(FlatEntry {
+                            name: top.clone(),
+                            is_dir: true,
+                            size: None,
+                            kind: FlatKind::Dir,
+                        });
+                        match self.folder_listing(&provider.provider, *list_id, complete) {
+                            Some(listing) => {
+                                for entry in listing.iter() {
+                                    let rel = entry.path.trim_matches('/').replace('/', "\\");
+                                    if rel.is_empty() {
+                                        continue;
+                                    }
+                                    let name = format!("{top}\\{rel}");
+                                    // Never announce a truncated (= wrong) name.
+                                    if name.encode_utf16().count() > Self::MAX_DESCRIPTOR_NAME {
+                                        continue;
+                                    }
+                                    res.push(FlatEntry {
+                                        name,
+                                        is_dir: entry.is_dir,
+                                        size: entry.size,
+                                        kind: if entry.is_dir {
+                                            FlatKind::Dir
+                                        } else {
+                                            FlatKind::FolderFile {
+                                                provider_index,
+                                                sub_path: entry.path.clone(),
+                                            }
+                                        },
+                                    });
+                                }
+                            }
+                            None => all_listed = false,
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let res = Rc::new(res);
+        if all_listed {
+            self.complete_entries.replace(Some(res.clone()));
+        }
+        res
+    }
+
+    fn data_for_file_group_descritor(&self) -> Option<Vec<u8>> {
+        let entries = self.flat_entries(self.is_transferring());
+        let len = entries.len() as u32;
         if len == 0 {
             return None;
         }
+        let mut res = Vec::new();
         res.extend_from_slice(unsafe { as_u8_slice(&len) });
-        for descriptor in &descriptors {
-            res.extend_from_slice(unsafe { as_u8_slice(descriptor) });
+        for entry in entries.iter() {
+            let descriptor = Self::file_descriptor_for_entry(&entry.name, entry.is_dir, entry.size);
+            res.extend_from_slice(unsafe { as_u8_slice(&descriptor) });
         }
         Some(res)
     }
@@ -342,6 +553,7 @@ impl DataObject {
         delegate: Rc<dyn PlatformDataProviderDelegate>,
         isolate_id: IsolateId,
         virtual_file_id: DataProviderValueId,
+        sub_path: Option<String>,
         configuration: QueueConfiguration,
     ) -> VirtualStreamSession {
         let (writer, reader) = new_segmented_queue(configuration);
@@ -350,18 +562,33 @@ impl DataObject {
         let size_promise_clone = size_promise.clone();
         let error_promise = Arc::new(Promise::<String>::new());
         let error_promise_clone = error_promise.clone();
-        let session_handle = delegate.get_virtual_file(
-            isolate_id,
-            virtual_file_id,
-            stream_handle,
-            Box::new(move |size| size_promise_clone.set(size)),
-            Box::new(move |_progress| {}),
-            Box::new(move |result| {
-                if let VirtualFileResult::Error { message } = result {
-                    error_promise_clone.set(message);
-                }
-            }),
-        );
+        let on_size_known: Box<dyn Fn(Option<i64>)> =
+            Box::new(move |size| size_promise_clone.set(size));
+        let on_progress: Box<dyn Fn(f64)> = Box::new(move |_progress| {});
+        let on_done: Box<dyn FnOnce(VirtualFileResult)> = Box::new(move |result| {
+            if let VirtualFileResult::Error { message } = result {
+                error_promise_clone.set(message);
+            }
+        });
+        let session_handle = match sub_path {
+            Some(sub_path) => delegate.get_virtual_folder_file(
+                isolate_id,
+                virtual_file_id,
+                sub_path,
+                stream_handle,
+                on_size_known,
+                on_progress,
+                on_done,
+            ),
+            None => delegate.get_virtual_file(
+                isolate_id,
+                virtual_file_id,
+                stream_handle,
+                on_size_known,
+                on_progress,
+                on_done,
+            ),
+        };
         VirtualStreamSession {
             reader,
             size_promise,
@@ -374,6 +601,7 @@ impl DataObject {
         &self,
         provider: &PlatformDataProvider,
         virtual_file_id: DataProviderValueId,
+        sub_path: Option<String>,
         storage_suggestion: &Option<VirtualFileStorage>,
         agile: bool,
     ) -> Option<IStream> {
@@ -399,6 +627,7 @@ impl DataObject {
                     delegate,
                     isolate_id,
                     virtual_file_id,
+                    sub_path,
                     configuration,
                 )
             };
@@ -420,29 +649,47 @@ impl DataObject {
         }
     }
 
-    fn stream_for_virtual_file_index(&self, mut index: usize, agile: bool) -> Option<IStream> {
-        for provider in &self.providers {
-            let provider = &provider.provider;
-            // Skip all virtual files before the requested one.
-            if index > 0
-                && provider
-                    .data
-                    .representations
-                    .iter()
-                    .any(|r| r.is_virtual_file())
-            {
-                index -= 1;
-                continue;
-            }
-            for repr in &provider.data.representations {
-                if let DataRepresentation::VirtualFile {
-                    id,
-                    format: _,
-                    storage_suggestion,
-                } = repr
-                {
-                    return self.stream_for_virtual_file(provider, *id, storage_suggestion, agile);
+    fn stream_for_virtual_file_index(&self, index: usize, agile: bool) -> Option<IStream> {
+        // Contents are only requested after the descriptor, i.e. while
+        // transferring — the listing has to be complete here.
+        let entries = self.flat_entries(true);
+        let entry = entries.get(index)?;
+        let (provider_index, sub_path) = match &entry.kind {
+            FlatKind::Dir => return None,
+            FlatKind::File { provider_index } => (*provider_index, None),
+            FlatKind::FolderFile {
+                provider_index,
+                sub_path,
+            } => (*provider_index, Some(sub_path.clone())),
+        };
+        let provider = &self.providers.get(provider_index)?.provider;
+        for repr in &provider.data.representations {
+            match (repr, &sub_path) {
+                (
+                    DataRepresentation::VirtualFile {
+                        id,
+                        storage_suggestion,
+                        ..
+                    },
+                    None,
+                )
+                | (
+                    DataRepresentation::VirtualFolder {
+                        id,
+                        storage_suggestion,
+                        ..
+                    },
+                    Some(_),
+                ) => {
+                    return self.stream_for_virtual_file(
+                        provider,
+                        *id,
+                        sub_path.clone(),
+                        storage_suggestion,
+                        agile,
+                    );
                 }
+                _ => {}
             }
         }
         None
@@ -495,6 +742,10 @@ impl IDataObject_Impl for DataObject {
         if format.cfFormat as u32 == format_file_contents {
             let stream = self
                 .stream_for_virtual_file_index(format.lindex as usize, Self::is_local_request());
+            if stream.is_none() && self.has_virtual_folder() {
+                // Directory entry (or out of range) — there is no content.
+                return Err(DV_E_FORMATETC.into());
+            }
             return Ok(STGMEDIUM {
                 tymed: TYMED_ISTREAM.0 as u32,
                 u: STGMEDIUM_0 {
@@ -577,8 +828,13 @@ impl IDataObject_Impl for DataObject {
                 && e.dwAspect == format.dwAspect
                 && e.lindex == format.lindex
         });
+        let is_folder_contents = format.cfFormat as u32
+            == unsafe { RegisterClipboardFormatW(CFSTR_FILECONTENTS) }
+            && (format.tymed & TYMED_ISTREAM.0 as u32) != 0
+            && self.has_virtual_folder();
         match index {
             Some(_) => S_OK,
+            None if is_folder_contents => S_OK,
             None => {
                 // possibly extra data
                 if (format.tymed == TYMED_HGLOBAL.0 as u32

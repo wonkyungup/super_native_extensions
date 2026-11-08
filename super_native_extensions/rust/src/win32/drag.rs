@@ -61,6 +61,9 @@ pub struct DropSource {
     last_reported_location: RefCell<Point>,
     session_id: DragSessionId,
     cancelled: Rc<Cell<bool>>,
+    /// Set once the user released the button over a target (drop committed).
+    /// Shared with the data object so it knows hover requests from the drop.
+    drop_committed: Rc<Cell<bool>>,
 }
 
 #[allow(non_snake_case)]
@@ -69,12 +72,14 @@ impl DropSource {
         platform_context: Weak<PlatformDragContext>,
         session_id: DragSessionId,
         cancelled: Rc<Cell<bool>>,
+        drop_committed: Rc<Cell<bool>>,
     ) -> IDropSource {
         Self {
             platform_context,
             session_id,
             last_reported_location: RefCell::new(Point::default()),
             cancelled,
+            drop_committed,
         }
         .into()
     }
@@ -91,6 +96,7 @@ impl IDropSource_Impl for DropSource {
             self.cancelled.replace(true);
             DRAGDROP_S_CANCEL
         } else if grfkeystate.0 & MK_LBUTTON.0 == 0 {
+            self.drop_committed.replace(true);
             DRAGDROP_S_DROP
         } else {
             let mut cursor_pos = POINT::default();
@@ -186,7 +192,8 @@ impl PlatformDragContext {
 
         let drag_image = drag_image.with_shadow(10);
 
-        let data_object = DataObject::create(providers);
+        let drop_committed = Rc::new(Cell::new(false));
+        let data_object = DataObject::create_for_drag(providers, drop_committed.clone());
         let helper: IDragSourceHelper = create_instance(&CLSID_DragDropHelper)?;
         let hbitmap = image_data_to_hbitmap(&drag_image.image_data)?;
         let device_pixel_ratio = drag_image.image_data.device_pixel_ratio.unwrap_or(1.0);
@@ -222,7 +229,12 @@ impl PlatformDragContext {
         }));
 
         let cancelled = Rc::new(Cell::new(false));
-        let drop_source = DropSource::create(self.weak_self.clone(), session_id, cancelled.clone());
+        let drop_source = DropSource::create(
+            self.weak_self.clone(),
+            session_id,
+            cancelled.clone(),
+            drop_committed,
+        );
         let mut effects_out = DROPEFFECT_NONE;
         unsafe {
             let _ = DoDragDrop(

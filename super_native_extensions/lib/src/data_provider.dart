@@ -53,6 +53,23 @@ sealed class DataRepresentation {
         storageSuggestion: storageSuggestion,
       );
 
+  /// Folder whose content is listed on demand by [listProvider] and whose
+  /// files are produced on demand by [fileProvider]. The folder name is the
+  /// item's `suggestedName`. Currently supported for drag and drop on Windows
+  /// only; other platforms ignore it.
+  static DataRepresentationVirtualFolder virtualFolder({
+    required String format,
+    required VirtualFolderListProvider listProvider,
+    required VirtualFolderFileProvider fileProvider,
+    VirtualFileStorage? storageSuggestion,
+  }) =>
+      DataRepresentationVirtualFolder._(
+        format: format,
+        listProvider: listProvider,
+        fileProvider: fileProvider,
+        storageSuggestion: storageSuggestion,
+      );
+
   String get format;
   dynamic serialize();
 }
@@ -140,6 +157,65 @@ class DataRepresentationVirtualFile extends DataRepresentation {
   final String format;
   final VirtualFileProvider virtualFileProvider;
 
+  final VirtualFileStorage? storageSuggestion;
+}
+
+/// Entry of a [DataRepresentationVirtualFolder] listing.
+class VirtualFolderEntry {
+  const VirtualFolderEntry.dir(this.path)
+      : isDir = true,
+        size = null;
+
+  const VirtualFolderEntry.file(this.path, {this.size}) : isDir = false;
+
+  /// Path relative to the folder, `/` separated (e.g. `sub/a.txt`).
+  final String path;
+  final bool isDir;
+
+  /// File size in bytes if known (lets the receiver show exact progress).
+  final int? size;
+
+  dynamic serialize() => {
+        'path': path,
+        'isDir': isDir,
+        'size': size,
+      };
+}
+
+/// Lists the whole content of a virtual folder (all levels). Called when the
+/// receiver first asks for it — with drag and drop right after the drag starts.
+typedef VirtualFolderListProvider = FutureOr<List<VirtualFolderEntry>>
+    Function();
+
+/// Called when the receiver requests the content of the file at [path]
+/// (as given in the listing).
+typedef VirtualFolderFileProvider = void Function(String path,
+    VirtualFileEventSinkProvider sinkProvider, WriteProgress progress);
+
+class DataRepresentationVirtualFolder extends DataRepresentation {
+  DataRepresentationVirtualFolder._({
+    required this.format,
+    required this.listProvider,
+    required this.fileProvider,
+    this.storageSuggestion,
+  })  : id = _nextId++,
+        listId = _nextId++;
+
+  @override
+  serialize() => {
+        'type': 'virtualFolder',
+        'id': id,
+        'listId': listId,
+        'format': format,
+        'storageSuggestion': storageSuggestion?.name,
+      };
+
+  final int id;
+  final int listId;
+  @override
+  final String format;
+  final VirtualFolderListProvider listProvider;
+  final VirtualFolderFileProvider fileProvider;
   final VirtualFileStorage? storageSuggestion;
 }
 

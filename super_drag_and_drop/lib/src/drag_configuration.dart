@@ -1,8 +1,15 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:super_clipboard/super_clipboard.dart';
+import 'package:super_native_extensions/raw_clipboard.dart' as raw;
 
 import 'model.dart';
+
+export 'package:super_native_extensions/raw_clipboard.dart'
+    show
+        VirtualFolderEntry,
+        VirtualFolderListProvider,
+        VirtualFolderFileProvider;
 
 /// Represent single item being dragged in a [DragSession].
 class DragItem extends DataWriterItem {
@@ -17,6 +24,34 @@ class DragItem extends DataWriterItem {
       (defaultTargetPlatform == TargetPlatform.macOS ||
           defaultTargetPlatform == TargetPlatform.windows ||
           defaultTargetPlatform == TargetPlatform.iOS);
+
+  /// Whether [addVirtualFolder] is supported on this platform.
+  bool get virtualFolderSupported =>
+      !kIsWeb && defaultTargetPlatform == TargetPlatform.windows;
+
+  /// Adds a virtual folder (named by [suggestedName]) to this item. The
+  /// receiver gets the whole tree: [listProvider] lists it (called right after
+  /// the drag starts; the drag does not wait for it) and [fileProvider]
+  /// produces each file when the receiver asks for it.
+  ///
+  /// Windows only (see [virtualFolderSupported]). Entries whose
+  /// `folder\path` exceeds 259 UTF-16 units are left out by the platform.
+  void addVirtualFolder({
+    required FileFormat format,
+    required raw.VirtualFolderListProvider listProvider,
+    required raw.VirtualFolderFileProvider fileProvider,
+    VirtualFileStorage? storageSuggestion,
+  }) {
+    assert(virtualFolderSupported);
+    add(EncodedData([
+      raw.DataRepresentation.virtualFolder(
+        format: format.providerFormat,
+        listProvider: listProvider,
+        fileProvider: fileProvider,
+        storageSuggestion: storageSuggestion,
+      )
+    ]));
+  }
 
   /// Data associated with this drag item that can be only read when dropping
   /// within same application. The data must be serializable with

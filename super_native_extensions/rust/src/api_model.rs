@@ -125,6 +125,28 @@ pub enum DataRepresentation {
         format: String,
         storage_suggestion: Option<VirtualFileStorage>,
     },
+    /// Folder whose content (a list of [VirtualFolderEntry]) is produced
+    /// lazily through `list_id` (same mechanism as [DataRepresentation::Lazy])
+    /// and whose files are produced on demand through `id` (same mechanism as
+    /// [DataRepresentation::VirtualFile], with the entry path passed along).
+    /// Currently implemented on Windows only; other platforms ignore it.
+    #[irondash(rename_all = "camelCase")]
+    VirtualFolder {
+        id: DataProviderValueId,
+        list_id: DataProviderValueId,
+        format: String,
+        storage_suggestion: Option<VirtualFileStorage>,
+    },
+}
+
+/// Single entry of a [DataRepresentation::VirtualFolder] listing.
+/// `path` is relative to the folder, `/` separated.
+#[derive(Debug, TryFromValue, Clone, PartialEq, Eq)]
+#[irondash(rename_all = "camelCase")]
+pub struct VirtualFolderEntry {
+    pub path: String,
+    pub is_dir: bool,
+    pub size: Option<i64>,
 }
 
 impl DataRepresentation {
@@ -147,7 +169,11 @@ impl DataRepresentation {
                 format,
                 storage_suggestion: _,
             } => format,
+            DataRepresentation::VirtualFolder { format, .. } => format,
         }
+    }
+    pub fn is_virtual_folder(&self) -> bool {
+        matches!(self, Self::VirtualFolder { .. })
     }
 }
 

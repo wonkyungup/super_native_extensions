@@ -74,6 +74,21 @@ pub trait PlatformDataProviderDelegate {
         on_progress: Box<dyn Fn(f64 /* 0.0 - 1.0 */)>,
         on_done: Box<dyn FnOnce(VirtualFileResult)>,
     ) -> Arc<VirtualSessionHandle>;
+
+    /// Like [get_virtual_file], but for one file inside a
+    /// `DataRepresentation::VirtualFolder`. `sub_path` is the entry path
+    /// relative to the folder (`/` separated).
+    #[allow(clippy::too_many_arguments)]
+    fn get_virtual_folder_file(
+        &self,
+        isolate_id: IsolateId,
+        virtual_file_id: DataProviderValueId,
+        sub_path: String,
+        stream_handle: i32,
+        on_size_known: Box<dyn Fn(Option<i64>)>,
+        on_progress: Box<dyn Fn(f64 /* 0.0 - 1.0 */)>,
+        on_done: Box<dyn FnOnce(VirtualFileResult)>,
+    ) -> Arc<VirtualSessionHandle>;
 }
 
 pub struct DataProviderManager {
@@ -289,6 +304,51 @@ impl PlatformDataProviderDelegate for DataProviderManager {
         on_progress: Box<dyn Fn(f64 /* 0.0 - 1.0 */)>,
         on_done: Box<dyn FnOnce(VirtualFileResult)>,
     ) -> Arc<VirtualSessionHandle> {
+        self.request_virtual_file(
+            isolate_id,
+            virtual_file_id,
+            None,
+            stream_handle,
+            on_size_known,
+            on_progress,
+            on_done,
+        )
+    }
+
+    fn get_virtual_folder_file(
+        &self,
+        isolate_id: IsolateId,
+        virtual_file_id: DataProviderValueId,
+        sub_path: String,
+        stream_handle: i32,
+        on_size_known: Box<dyn Fn(Option<i64>)>,
+        on_progress: Box<dyn Fn(f64 /* 0.0 - 1.0 */)>,
+        on_done: Box<dyn FnOnce(VirtualFileResult)>,
+    ) -> Arc<VirtualSessionHandle> {
+        self.request_virtual_file(
+            isolate_id,
+            virtual_file_id,
+            Some(sub_path),
+            stream_handle,
+            on_size_known,
+            on_progress,
+            on_done,
+        )
+    }
+}
+
+impl DataProviderManager {
+    #[allow(clippy::too_many_arguments)]
+    fn request_virtual_file(
+        &self,
+        isolate_id: IsolateId,
+        virtual_file_id: DataProviderValueId,
+        sub_path: Option<String>,
+        stream_handle: i32,
+        on_size_known: Box<dyn Fn(Option<i64>)>,
+        on_progress: Box<dyn Fn(f64 /* 0.0 - 1.0 */)>,
+        on_done: Box<dyn FnOnce(VirtualFileResult)>,
+    ) -> Arc<VirtualSessionHandle> {
         let weak_self = self.weak_self.clone();
         let session_id: VirtualSessionId = self.next_id.next_id().into();
         let sesion = VirtualFileSession {
@@ -306,6 +366,7 @@ impl PlatformDataProviderDelegate for DataProviderManager {
         struct VirtualFileRequest {
             session_id: VirtualSessionId,
             virtual_file_id: DataProviderValueId,
+            sub_path: Option<String>,
             stream_handle: i32,
         }
         self.invoker.call_method_sync(
@@ -314,6 +375,7 @@ impl PlatformDataProviderDelegate for DataProviderManager {
             VirtualFileRequest {
                 session_id,
                 virtual_file_id,
+                sub_path,
                 stream_handle,
             },
             |r| {
