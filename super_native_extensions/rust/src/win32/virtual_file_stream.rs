@@ -270,8 +270,15 @@ impl VirtualFileStream {
         });
 
         let res = promise.wait();
-        let stream = res.0.take();
-        let stream: IStream = unsafe { CoGetInterfaceAndReleaseStream(&stream) }.unwrap();
+        let marshal_stream = res.0.take();
+        let stream: IStream =
+            unsafe { CoGetInterfaceAndReleaseStream(&marshal_stream) }.unwrap();
+        // CoGetInterfaceAndReleaseStream already released the marshal stream
+        // (even on failure). Dropping `marshal_stream` would release it a second
+        // time — it happens to survive in a plain exe, but in an MSIX-packaged
+        // app it is an access violation, which Explorer reports as "the server
+        // threw an exception" when a virtual file is dropped.
+        std::mem::forget(marshal_stream);
         let drop_notifier = Arc::new(DropNotifier::new_with_boxed(res.1));
         (stream, drop_notifier)
     }
