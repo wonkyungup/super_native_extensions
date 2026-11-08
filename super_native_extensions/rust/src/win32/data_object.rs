@@ -542,8 +542,15 @@ impl DataObject {
         }
         let mut res = Vec::new();
         res.extend_from_slice(unsafe { as_u8_slice(&len) });
+        // Sizes are all or nothing. When some file descriptors carry
+        // FD_FILESIZE and others don't (a plain virtual file dragged together
+        // with a virtual folder), Explorer does not Stat the size-less stream
+        // and writes a file of the wrong length (observed: the sum of the
+        // folder's file sizes). Without any FD_FILESIZE it asks each stream.
+        let all_sized = entries.iter().all(|e| e.is_dir || e.size.is_some());
         for entry in entries.iter() {
-            let descriptor = Self::file_descriptor_for_entry(&entry.name, entry.is_dir, entry.size);
+            let size = if all_sized { entry.size } else { None };
+            let descriptor = Self::file_descriptor_for_entry(&entry.name, entry.is_dir, size);
             res.extend_from_slice(unsafe { as_u8_slice(&descriptor) });
         }
         Some(res)
