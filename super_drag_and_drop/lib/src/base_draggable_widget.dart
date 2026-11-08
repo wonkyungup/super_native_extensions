@@ -76,7 +76,11 @@ class BaseDraggableWidget extends StatelessWidget {
               child: child!,
             );
           } else {
+            // Mouse: the delayed recognizer must not join the arena, otherwise
+            // holding still for kLongPressTimeout before moving makes it win
+            // (with a no-op onStart) and the drag never starts.
             return DummyDragDetector(
+              supportedDevices: const {PointerDeviceKind.touch},
               child: DesktopDragDetector(
                 hitTestBehavior: hitTestBehavior,
                 dragConfiguration: dragConfiguration,

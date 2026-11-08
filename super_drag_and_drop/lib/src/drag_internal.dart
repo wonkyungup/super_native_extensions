@@ -333,9 +333,13 @@ class DummyDragDetector extends StatelessWidget {
   const DummyDragDetector({
     super.key,
     required this.child,
+    this.supportedDevices,
   });
 
   final Widget child;
+
+  /// Pointer kinds the delayed recognizer competes for (null = all).
+  final Set<PointerDeviceKind>? supportedDevices;
 
   @override
   Widget build(BuildContext context) {
@@ -343,7 +347,8 @@ class DummyDragDetector extends StatelessWidget {
       gestures: {
         DelayedMultiDragGestureRecognizer: GestureRecognizerFactoryWithHandlers<
                 DelayedMultiDragGestureRecognizer>(
-            () => DelayedMultiDragGestureRecognizer(), (recognizer) {
+            () => DelayedMultiDragGestureRecognizer(
+                supportedDevices: supportedDevices), (recognizer) {
           recognizer.onStart = (offset) {
             return null;
           };
