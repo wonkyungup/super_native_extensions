@@ -3,11 +3,12 @@ use std::{
     collections::HashMap,
     fs::File,
     io::Write,
-    mem::ManuallyDrop,
-    os::unix::prelude::{FromRawFd, IntoRawFd},
     path::PathBuf,
     rc::{Rc, Weak},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicI32, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use block2::{Block, RcBlock};
@@ -65,18 +66,19 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
+/// Handles are never reused. They used to be the file descriptor, but with
+/// several files written at once (two folders dragged together) a closed
+/// descriptor's number was reopened by another stream before the first one
+/// collected its result, which wiped it and left that folder waiting forever.
+static NEXT_STREAM_HANDLE: AtomicI32 = AtomicI32::new(1);
+
 /// Hands [file] (at [path]) to a writer thread; returns the stream handle.
 /// Must be called on the main thread.
-fn open_stream(file: File, path: PathBuf) -> i32 {
-    let handle = file.into_raw_fd();
-    // The descriptor is only closed on the main thread (below), so a stale
-    // result for a reused number can only be from a stream nobody waited on.
-    STREAM_RESULTS.with(|r| r.borrow_mut().remove(&handle));
+fn open_stream(mut file: File, path: PathBuf) -> i32 {
+    let handle = NEXT_STREAM_HANDLE.fetch_add(1, Ordering::Relaxed);
     let (sender, receiver) = std::sync::mpsc::channel::<StreamMessage>();
     let main = RunLoop::current().new_sender();
     std::thread::spawn(move || {
-        // Does not own the descriptor — the main thread closes it.
-        let mut file = ManuallyDrop::new(unsafe { File::from_raw_fd(handle) });
         let mut ok = true;
         let mut delete = true; // sender dropped without close: discard.
         for message in receiver {
@@ -92,6 +94,7 @@ fn open_stream(file: File, path: PathBuf) -> i32 {
                 }
             }
         }
+        drop(file);
         main.send(move || stream_finished(handle, path, ok && !delete, delete));
     });
     STREAM_WRITERS
@@ -102,7 +105,6 @@ fn open_stream(file: File, path: PathBuf) -> i32 {
 }
 
 fn stream_finished(handle: i32, path: PathBuf, ok: bool, delete: bool) {
-    unsafe { File::from_raw_fd(handle) };
     if delete {
         std::fs::remove_file(path).ok();
     }
