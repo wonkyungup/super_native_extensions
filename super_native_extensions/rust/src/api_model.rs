@@ -129,7 +129,7 @@ pub enum DataRepresentation {
     /// lazily through `list_id` (same mechanism as [DataRepresentation::Lazy])
     /// and whose files are produced on demand through `id` (same mechanism as
     /// [DataRepresentation::VirtualFile], with the entry path passed along).
-    /// Currently implemented on Windows only; other platforms ignore it.
+    /// Implemented on Windows and macOS; other platforms ignore it.
     #[irondash(rename_all = "camelCase")]
     VirtualFolder {
         id: DataProviderValueId,

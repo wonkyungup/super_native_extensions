@@ -27,15 +27,19 @@ class DragItem extends DataWriterItem {
 
   /// Whether [addVirtualFolder] is supported on this platform.
   bool get virtualFolderSupported =>
-      !kIsWeb && defaultTargetPlatform == TargetPlatform.windows;
+      !kIsWeb &&
+      (defaultTargetPlatform == TargetPlatform.windows ||
+          defaultTargetPlatform == TargetPlatform.macOS);
 
   /// Adds a virtual folder (named by [suggestedName]) to this item. The
   /// receiver gets the whole tree: [listProvider] lists it (called right after
   /// the drag starts; the drag does not wait for it) and [fileProvider]
   /// produces each file when the receiver asks for it.
   ///
-  /// Windows only (see [virtualFolderSupported]). Entries whose
-  /// `folder\path` exceeds 259 UTF-16 units are left out by the platform.
+  /// Windows and macOS (see [virtualFolderSupported]). On Windows entries
+  /// whose `folder\path` exceeds 259 UTF-16 units are left out by the
+  /// platform. On macOS the folder is a file promise: Finder creates it and
+  /// the files are written into it one after another after the drop.
   void addVirtualFolder({
     required FileFormat format,
     required raw.VirtualFolderListProvider listProvider,

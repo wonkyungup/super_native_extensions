@@ -28,14 +28,15 @@ use objc2_foundation::{NSArray, NSError, NSProgress, NSProgressKindFile, NSStrin
 use once_cell::sync::Lazy;
 
 use crate::{
-    api_model::{DataProvider, DataProviderValueId, DataRepresentation},
+    api_model::{DataProvider, DataProviderValueId, DataRepresentation, VirtualFolderEntry},
     data_provider_manager::{
         DataProviderHandle, PlatformDataProviderDelegate, VirtualFileResult, VirtualSessionHandle,
     },
     error::NativeExtensionsResult,
     log::OkLog,
+    util::DropNotifier,
     platform_impl::platform::common::{path_from_url, to_nserror},
-    value_promise::ValuePromiseResult,
+    value_promise::{ValuePromise, ValuePromiseResult},
 };
 
 pub fn platform_stream_write(handle: i32, data: &[u8]) -> i32 {
@@ -143,6 +144,203 @@ pub struct ItemState {
 struct VirtualFileInfo {
     id: DataProviderValueId,
     format: String,
+    /// `Some(list_id)` for a [DataRepresentation::VirtualFolder].
+    folder_list_id: Option<DataProviderValueId>,
+}
+
+/// UTI of the promised item for a virtual folder. Finder creates a folder for
+/// the promise and we fill it in `writePromiseToURL`.
+const FOLDER_FILE_TYPE: &str = "public.folder";
+
+/// State of one virtual folder being written into the URL Finder gave us.
+///
+/// Files are produced one after another (the Dart side may prefetch ahead).
+/// Everything runs on the main thread (the file promise operation queue is
+/// the main queue and Dart replies arrive on the platform run loop).
+struct FolderWrite {
+    root: PathBuf,
+    id: DataProviderValueId,
+    isolate_id: IsolateId,
+    delegate: Weak<dyn PlatformDataProviderDelegate>,
+    progress: Id<NSProgress>,
+    /// Files still to write (relative paths, sizes), in order.
+    files: RefCell<std::collections::VecDeque<(String, Option<i64>)>>,
+    files_done: Cell<usize>,
+    current: RefCell<Option<Arc<VirtualSessionHandle>>>,
+    cancelled: Cell<bool>,
+    /// Files and folders this write created (in creation order), removed
+    /// again if it fails or is cancelled so no partial copy is left behind.
+    created: RefCell<Vec<(PathBuf, bool)>>,
+    completion: RefCell<Option<Box<dyn FnOnce(Option<Id<NSError>>)>>>,
+    _data_provider_handle: Arc<DataProviderHandle>,
+    /// Keeps this alive until [finish]. Nothing else holds it strongly: the
+    /// callbacks only have weak references, and dropping it would drop the
+    /// current virtual session handle, which cancels the file being written.
+    self_ref: RefCell<Option<Rc<FolderWrite>>>,
+}
+
+impl FolderWrite {
+    fn finish(&self, error: Option<String>) {
+        let completion = self.completion.borrow_mut().take();
+        if let Some(completion) = completion {
+            if error.is_some() {
+                self.remove_created();
+            }
+            unsafe { self.progress.unpublish() };
+            completion(error.map(|e| to_nserror("super_dnd", 0, &e)));
+        }
+        // Last: may drop self.
+        let _self_ref = self.self_ref.borrow_mut().take();
+    }
+
+    /// Creates [dir] (and missing parents), remembering the ones it made.
+    fn create_dir(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        let mut missing = Vec::new();
+        let mut cur = Some(dir);
+        while let Some(d) = cur {
+            if d.exists() {
+                break;
+            }
+            missing.push(d.to_path_buf());
+            cur = d.parent();
+        }
+        std::fs::create_dir_all(dir)?;
+        let mut created = self.created.borrow_mut();
+        created.extend(missing.into_iter().rev().map(|d| (d, true)));
+        Ok(())
+    }
+
+    /// Removes what [created] lists, newest first. Folders are only removed
+    /// when empty, so nothing that was there before is touched.
+    fn remove_created(&self) {
+        let created = std::mem::take(&mut *self.created.borrow_mut());
+        for (path, is_dir) in created.into_iter().rev() {
+            let _ = if is_dir {
+                std::fs::remove_dir(&path)
+            } else {
+                std::fs::remove_file(&path)
+            };
+        }
+    }
+
+    /// Joins a listing path under [root], refusing anything that could escape
+    /// it (absolute paths, `..`, empty components).
+    fn target(&self, rel: &str) -> Option<PathBuf> {
+        let mut path = self.root.clone();
+        for part in rel.split('/') {
+            if part.is_empty() || part == "." || part == ".." || part.contains('\0') {
+                return None;
+            }
+            path.push(part);
+        }
+        Some(path)
+    }
+
+    fn on_listing(self: &Rc<Self>, result: Option<ValuePromiseResult>) {
+        if self.cancelled.get() {
+            return self.finish(Some("Cancelled".into()));
+        }
+        let mut entries = match result {
+            Some(ValuePromiseResult::Ok { value }) => {
+                match Vec::<VirtualFolderEntry>::try_from(value) {
+                    Ok(entries) => entries,
+                    Err(e) => return self.finish(Some(format!("invalid folder listing: {e:?}"))),
+                }
+            }
+            _ => return self.finish(Some("folder listing unavailable".into())),
+        };
+        // Parents before children.
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut files = std::collections::VecDeque::new();
+        for entry in entries {
+            let Some(target) = self.target(&entry.path) else {
+                continue;
+            };
+            if entry.is_dir {
+                if let Err(e) = self.create_dir(&target) {
+                    return self.finish(Some(e.to_string()));
+                }
+            } else {
+                files.push_back((entry.path, entry.size));
+            }
+        }
+        unsafe {
+            self.progress
+                .setTotalUnitCount((files.len().max(1) * 1000) as i64)
+        };
+        *self.files.borrow_mut() = files;
+        self.next_file();
+    }
+
+    fn next_file(self: &Rc<Self>) {
+        if self.cancelled.get() {
+            return self.finish(Some("Cancelled".into()));
+        }
+        let Some((rel, _size)) = self.files.borrow_mut().pop_front() else {
+            unsafe {
+                self.progress
+                    .setCompletedUnitCount(self.progress.totalUnitCount())
+            };
+            return self.finish(None);
+        };
+        let Some(delegate) = self.delegate.upgrade() else {
+            return self.finish(Some("data not found".into()));
+        };
+        let Some(path) = self.target(&rel) else {
+            return self.next_file();
+        };
+        if let Some(parent) = path.parent() {
+            if let Err(e) = self.create_dir(parent) {
+                return self.finish(Some(e.to_string()));
+            }
+        }
+        let file = match File::create(&path) {
+            Ok(file) => file,
+            Err(e) => return self.finish(Some(e.to_string())),
+        };
+        self.created.borrow_mut().push((path.clone(), false));
+        let descriptor = file.into_raw_fd();
+        FILE_PATHS.lock().unwrap().insert(descriptor, path);
+
+        let done_units = (self.files_done.get() * 1000) as i64;
+        let progress = self.progress.clone();
+        let weak = Rc::downgrade(self);
+        let notifier = delegate.get_virtual_folder_file(
+            self.isolate_id,
+            self.id,
+            rel,
+            descriptor,
+            Box::new(|_| {}),
+            Box::new(move |cnt| {
+                let completed = done_units + (cnt * 1000.0).round() as i64;
+                unsafe { progress.setCompletedUnitCount(completed) };
+            }),
+            Box::new(move |result| {
+                let Some(this) = weak.upgrade() else {
+                    return;
+                };
+                this.current.borrow_mut().take();
+                match result {
+                    VirtualFileResult::Done => {
+                        this.files_done.set(this.files_done.get() + 1);
+                        this.next_file();
+                    }
+                    VirtualFileResult::Error { message } => this.finish(Some(message)),
+                    VirtualFileResult::Cancelled => this.finish(Some("Cancelled".into())),
+                }
+            }),
+        );
+        self.current.replace(Some(notifier));
+    }
+
+    fn cancel(&self) {
+        self.cancelled.set(true);
+        let current = self.current.borrow_mut().take();
+        if let Some(current) = current {
+            current.dispose();
+        }
+        self.finish(Some("Cancelled".into()));
+    }
 }
 
 impl ItemState {
@@ -160,7 +358,11 @@ impl ItemState {
                 let provider = SNEForwardingFilePromiseProvider::init(
                     SNEForwardingFilePromiseProvider::alloc(),
                 );
-                provider.setFileType(&NSString::from_str(&info.format));
+                let file_type = match info.folder_list_id {
+                    Some(_) => FOLDER_FILE_TYPE,
+                    None => &info.format,
+                };
+                provider.setFileType(&NSString::from_str(file_type));
                 provider.setDelegate(Some(&Id::cast(writer.clone())));
                 provider.setWritingDelegate(Some(&Id::cast(writer)));
                 Id::cast(provider)
@@ -180,6 +382,14 @@ impl ItemState {
                 } => Some(VirtualFileInfo {
                     id: *id,
                     format: format.clone(),
+                    folder_list_id: None,
+                }),
+                DataRepresentation::VirtualFolder {
+                    id, list_id, format, ..
+                } => Some(VirtualFileInfo {
+                    id: *id,
+                    format: format.clone(),
+                    folder_list_id: Some(*list_id),
                 }),
                 _ => None,
             })
@@ -351,6 +561,66 @@ impl ItemState {
         }
     }
 
+    /// Virtual folder: create the folder at [url], ask Dart for the listing,
+    /// create the sub folders and then produce the files one by one.
+    fn file_promise_do_write_folder(
+        url: &NSURL,
+        completion_fn: Box<dyn FnOnce(Option<Id<NSError>>)>,
+        info: VirtualFileInfo,
+        data_provider: Rc<PlatformDataProvider>,
+        delegate: Rc<dyn PlatformDataProviderDelegate>,
+        data_provider_handle: Arc<DataProviderHandle>,
+    ) {
+        let root = path_from_url(url);
+        let progress = Self::progress_for_url(url);
+        let state = Rc::new(FolderWrite {
+            root: root.clone(),
+            id: info.id,
+            isolate_id: data_provider.isolate_id,
+            delegate: Rc::downgrade(&delegate),
+            progress: progress.clone(),
+            files: RefCell::new(Default::default()),
+            files_done: Cell::new(0),
+            current: RefCell::new(None),
+            cancelled: Cell::new(false),
+            created: RefCell::new(Vec::new()),
+            completion: RefCell::new(Some(completion_fn)),
+            _data_provider_handle: data_provider_handle,
+            self_ref: RefCell::new(None),
+        });
+        state.self_ref.replace(Some(state.clone()));
+        if let Err(err) = state.create_dir(&root) {
+            return state.finish(Some(err.to_string()));
+        }
+
+        // NSProgress may call the cancellation handler on any thread;
+        // DropNotifier hops back to this (main) thread before touching state.
+        // Dropping it after the write finished is harmless (finish runs once).
+        let weak = Rc::downgrade(&state);
+        let cancel_notifier = Arc::new(DropNotifier::new(move || {
+            if let Some(state) = weak.upgrade() {
+                state.cancel();
+            }
+        }));
+        let cancellation_handler = RcBlock::new(move || cancel_notifier.dispose());
+        unsafe { progress.setCancellationHandler(Some(&cancellation_handler)) };
+
+        // The promise is filled before `on_done` runs; keep it where the
+        // callback can reach it (it never runs synchronously).
+        let promise_slot: Rc<RefCell<Option<Arc<ValuePromise>>>> = Rc::new(RefCell::new(None));
+        let slot = promise_slot.clone();
+        let state_clone = state.clone();
+        let promise = delegate.get_lazy_data(
+            data_provider.isolate_id,
+            info.folder_list_id.unwrap(),
+            Some(Box::new(move || {
+                let result = slot.borrow_mut().take().and_then(|p| p.try_take());
+                state_clone.on_listing(result);
+            })),
+        );
+        promise_slot.replace(Some(promise));
+    }
+
     fn file_promise_write_to_url(
         self: &Rc<Self>,
         url: &NSURL,
@@ -362,6 +632,18 @@ impl ItemState {
         let data_provider_handle = self.data_provider_handle.upgrade();
 
         match (info, data_provider, delegate, data_provider_handle) {
+            (Some(info), Some(clipboard), Some(delegate), Some(drop_notifier))
+                if info.folder_list_id.is_some() =>
+            {
+                Self::file_promise_do_write_folder(
+                    url,
+                    completion_fn,
+                    info,
+                    clipboard,
+                    delegate,
+                    drop_notifier,
+                );
+            }
             (Some(info), Some(clipboard), Some(delegate), Some(drop_notifier)) => {
                 self.file_promise_do_write(
                     url,
@@ -451,11 +733,15 @@ declare_class!(
             let completion_handler =
                 RcBlock::<dyn Fn(*mut NSError)>::copy(completion_handler as *const _ as *mut _).unwrap();
             let completion_fn = move |error: Option<Id<NSError>>| {
-                let error = match error {
-                    Some(error) => Id::as_ptr(&error),
+                // Keep `error` alive until the handler returns. Taking the
+                // pointer inside a `match` arm used to drop the NSError there
+                // and pass a dangling pointer (crash on cancel / failure).
+                let ptr = match &error {
+                    Some(error) => Id::as_ptr(error) as *mut NSError,
                     None => std::ptr::null_mut(),
                 };
-                completion_handler.call((error as *mut _,));
+                completion_handler.call((ptr,));
+                drop(error);
             };
             self.ivars().item_state
                 .file_promise_write_to_url(url, Box::new(completion_fn));

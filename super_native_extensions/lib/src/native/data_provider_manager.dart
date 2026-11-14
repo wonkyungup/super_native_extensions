@@ -117,9 +117,20 @@ class DataProviderManagerImpl implements DataProviderManager {
     String? subPath,
     required int streamHandle,
   }) async {
+    // The receiver may cancel at any time, after which the native side drops
+    // the session; late calls for it are then expected to fail and must not
+    // surface as uncaught exceptions.
+    Future<void> send(String method, Map<String, dynamic> args) async {
+      try {
+        await _channel.invokeMethod(method, args);
+      } on PlatformException catch (e) {
+        if (e.details != 'virtualFileSessionNotFound') rethrow;
+      }
+    }
+
     final progressNotifier = ValueNotifier<double>(0.0);
     progressNotifier.addListener(() {
-      _channel.invokeMethod('virtualFileUpdateProgress', {
+      send('virtualFileUpdateProgress', {
         'sessionId': sessionId,
         'progress': progressNotifier.value,
       });
@@ -128,20 +139,21 @@ class DataProviderManagerImpl implements DataProviderManager {
     final session = _VirtualSession(progress: progress);
     _virtualSessions[sessionId] = session;
 
-    Future<void> onComplete() async {
-      await _channel.invokeMethod('virtualFileComplete', {
-        'sessionId': sessionId,
-      });
-      _virtualSessions.remove(sessionId);
+    Future<void> report(String method, Map<String, dynamic> args) async {
+      try {
+        await send(method, args);
+      } finally {
+        _virtualSessions.remove(sessionId);
+      }
     }
 
-    Future<void> onError(String errorMessage) async {
-      await _channel.invokeMethod('virtualFileError', {
-        'sessionId': sessionId,
-        'errorMessage': errorMessage,
-      });
-      _virtualSessions.remove(sessionId);
-    }
+    Future<void> onComplete() =>
+        report('virtualFileComplete', {'sessionId': sessionId});
+
+    Future<void> onError(String errorMessage) => report('virtualFileError', {
+          'sessionId': sessionId,
+          'errorMessage': errorMessage,
+        });
 
     final sink = _VirtualFileSink(
       session: session,
@@ -159,7 +171,7 @@ class DataProviderManagerImpl implements DataProviderManager {
           throw StateError("File size can not be changed");
         }
         if (session._fileSize == null) {
-          _channel.invokeMethod("virtualFileSizeKnown", {
+          send("virtualFileSizeKnown", {
             'sessionId': sessionId,
             'fileSize': fileSize,
           });
@@ -178,7 +190,7 @@ class DataProviderManagerImpl implements DataProviderManager {
     }
     progress.onCancel.addListener(() async {
       sink._close(delete: true);
-      await _channel.invokeMethod('virtualFileCancel', {
+      await send('virtualFileCancel', {
         'sessionId': sessionId,
       });
     });

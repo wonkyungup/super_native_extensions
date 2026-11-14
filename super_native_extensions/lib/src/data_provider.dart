@@ -55,8 +55,8 @@ sealed class DataRepresentation {
 
   /// Folder whose content is listed on demand by [listProvider] and whose
   /// files are produced on demand by [fileProvider]. The folder name is the
-  /// item's `suggestedName`. Currently supported for drag and drop on Windows
-  /// only; other platforms ignore it.
+  /// item's `suggestedName`. Supported for drag and drop on Windows and
+  /// macOS; other platforms ignore it.
   static DataRepresentationVirtualFolder virtualFolder({
     required String format,
     required VirtualFolderListProvider listProvider,
