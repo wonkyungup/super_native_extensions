@@ -39,23 +39,108 @@ use crate::{
     value_promise::{ValuePromise, ValuePromiseResult},
 };
 
-pub fn platform_stream_write(handle: i32, data: &[u8]) -> i32 {
-    let mut file = ManuallyDrop::new(unsafe { File::from_raw_fd(handle) });
-    match file.write_all(data) {
-        Ok(_) => 1,
-        Err(_) => 0,
+// Virtual file streams. Dart writes from its UI isolate, which on macOS runs
+// on the main thread, so writing the file there froze the app (and Finder's
+// drop) for every chunk. Like the Windows in-memory queue, `write` only queues
+// the bytes; a thread per stream writes them. Finder is told the file is done
+// only after that thread flushed it ([wait_for_stream]).
+
+enum StreamMessage {
+    Data(Vec<u8>),
+    Close { delete: bool },
+}
+
+struct StreamWriter {
+    sender: std::sync::mpsc::Sender<StreamMessage>,
+}
+
+static STREAM_WRITERS: Lazy<Mutex<HashMap<i32, StreamWriter>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+thread_local! {
+    /// Main thread: results of streams whose thread finished before anyone
+    /// waited on them, and the callbacks waiting for the others.
+    static STREAM_RESULTS: RefCell<HashMap<i32, bool>> = RefCell::new(HashMap::new());
+    static STREAM_WAITERS: RefCell<HashMap<i32, Box<dyn FnOnce(bool)>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Hands [file] (at [path]) to a writer thread; returns the stream handle.
+/// Must be called on the main thread.
+fn open_stream(file: File, path: PathBuf) -> i32 {
+    let handle = file.into_raw_fd();
+    // The descriptor is only closed on the main thread (below), so a stale
+    // result for a reused number can only be from a stream nobody waited on.
+    STREAM_RESULTS.with(|r| r.borrow_mut().remove(&handle));
+    let (sender, receiver) = std::sync::mpsc::channel::<StreamMessage>();
+    let main = RunLoop::current().new_sender();
+    std::thread::spawn(move || {
+        // Does not own the descriptor — the main thread closes it.
+        let mut file = ManuallyDrop::new(unsafe { File::from_raw_fd(handle) });
+        let mut ok = true;
+        let mut delete = true; // sender dropped without close: discard.
+        for message in receiver {
+            match message {
+                StreamMessage::Data(data) => {
+                    if ok && file.write_all(&data).is_err() {
+                        ok = false;
+                    }
+                }
+                StreamMessage::Close { delete: d } => {
+                    delete = d;
+                    break;
+                }
+            }
+        }
+        main.send(move || stream_finished(handle, path, ok && !delete, delete));
+    });
+    STREAM_WRITERS
+        .lock()
+        .unwrap()
+        .insert(handle, StreamWriter { sender });
+    handle
+}
+
+fn stream_finished(handle: i32, path: PathBuf, ok: bool, delete: bool) {
+    unsafe { File::from_raw_fd(handle) };
+    if delete {
+        std::fs::remove_file(path).ok();
+    }
+    let waiter = STREAM_WAITERS.with(|w| w.borrow_mut().remove(&handle));
+    match waiter {
+        Some(waiter) => waiter(ok),
+        None => {
+            STREAM_RESULTS.with(|r| r.borrow_mut().insert(handle, ok));
+        }
     }
 }
 
-static FILE_PATHS: Lazy<Mutex<HashMap<i32, PathBuf>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+/// Calls [done] on the main thread once everything written to [handle] is on
+/// disk (`true`), or writing failed / it was discarded (`false`).
+fn wait_for_stream(handle: i32, done: Box<dyn FnOnce(bool)>) {
+    match STREAM_RESULTS.with(|r| r.borrow_mut().remove(&handle)) {
+        Some(ok) => done(ok),
+        None => {
+            STREAM_WAITERS.with(|w| w.borrow_mut().insert(handle, done));
+        }
+    }
+}
+
+pub fn platform_stream_write(handle: i32, data: &[u8]) -> i32 {
+    let writers = STREAM_WRITERS.lock().unwrap();
+    match writers.get(&handle) {
+        Some(writer) => match writer.sender.send(StreamMessage::Data(data.to_vec())) {
+            Ok(_) => 1,
+            Err(_) => 0,
+        },
+        None => 0,
+    }
+}
 
 pub fn platform_stream_close(handle: i32, delete: bool) {
-    unsafe { File::from_raw_fd(handle) };
-    let path = FILE_PATHS.lock().unwrap().remove(&handle);
-    if let Some(path) = path {
-        if delete {
-            std::fs::remove_file(path).ok();
-        }
+    let writer = STREAM_WRITERS.lock().unwrap().remove(&handle);
+    if let Some(writer) = writer {
+        writer.sender.send(StreamMessage::Close { delete }).ok();
     }
 }
 
@@ -299,8 +384,7 @@ impl FolderWrite {
             Err(e) => return self.finish(Some(e.to_string())),
         };
         self.created.borrow_mut().push((path.clone(), false));
-        let descriptor = file.into_raw_fd();
-        FILE_PATHS.lock().unwrap().insert(descriptor, path);
+        let descriptor = open_stream(file, path);
 
         let done_units = (self.files_done.get() * 1000) as i64;
         let progress = self.progress.clone();
@@ -322,8 +406,20 @@ impl FolderWrite {
                 this.current.borrow_mut().take();
                 match result {
                     VirtualFileResult::Done => {
-                        this.files_done.set(this.files_done.get() + 1);
-                        this.next_file();
+                        let weak = Rc::downgrade(&this);
+                        wait_for_stream(
+                            descriptor,
+                            Box::new(move |ok| {
+                                let Some(this) = weak.upgrade() else {
+                                    return;
+                                };
+                                if !ok {
+                                    return this.finish(Some("failed to write file".into()));
+                                }
+                                this.files_done.set(this.files_done.get() + 1);
+                                this.next_file();
+                            }),
+                        );
                     }
                     VirtualFileResult::Error { message } => this.finish(Some(message)),
                     VirtualFileResult::Cancelled => this.finish(Some("Cancelled".into())),
@@ -519,8 +615,7 @@ impl ItemState {
                 return;
             }
         };
-        let descriptor = file.into_raw_fd();
-        FILE_PATHS.lock().unwrap().insert(descriptor, path);
+        let descriptor = open_stream(file, path);
 
         let progress_clone = progress.clone();
         let progress_clone2 = progress.clone();
@@ -537,7 +632,16 @@ impl ItemState {
                 let _handle = data_provider_handle;
                 unsafe { progress_clone2.unpublish() };
                 match result {
-                    VirtualFileResult::Done => completion_fn(None),
+                    VirtualFileResult::Done => wait_for_stream(
+                        descriptor,
+                        Box::new(move |ok| {
+                            completion_fn(if ok {
+                                None
+                            } else {
+                                Some(to_nserror("super_dnd", 0, "failed to write file"))
+                            })
+                        }),
+                    ),
                     VirtualFileResult::Error { message } => {
                         let error = to_nserror("super_dnd", 0, &message);
                         completion_fn(Some(error));
